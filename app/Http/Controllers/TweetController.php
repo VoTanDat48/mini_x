@@ -2,83 +2,218 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\StoreTweetRequest;
 use App\Models\Tweet;
+use App\Models\TweetView;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
 use Inertia\Inertia;
+use Inertia\Response;
 
 class TweetController extends Controller
 {
     /**
-     * 1. Hiển thị danh sách Tweet ra trang Welcome
+     * Display a listing of the top-level tweets.
      */
-    public function index()
+    public function index(Request $request): Response
     {
+        $user = $request->user();
+        $userId = $user?->id;
+        $tab = $request->query('tab', 'for-you');
+
+        $excludedUserIds = collect();
+        if ($user) {
+            $blockedIds = $user->blockedUsers()->pluck('blocked_id');
+            $blockedByIds = $user->blockedByUsers()->pluck('user_id');
+            $mutedIds = $user->mutedUsers()->pluck('muted_id');
+            $excludedUserIds = $blockedIds->merge($blockedByIds)->merge($mutedIds)->unique();
+        }
+
+        $query = Tweet::whereNull('parent_id')
+            ->when($excludedUserIds->isNotEmpty(), fn ($q) => $q->whereNotIn('user_id', $excludedUserIds));
+
+        if ($tab === 'following') {
+            if ($user) {
+                $followingIds = $user->following()->pluck('following_id');
+                // Display posts from followed accounts plus author's own posts
+                $feedUserIds = $followingIds->push($user->id)->unique();
+                $query->whereIn('user_id', $feedUserIds);
+            } else {
+                // Guests see an empty following feed
+                $query->whereRaw('1 = 0');
+            }
+        }
+
+        $tweets = $query->withInteractionDetails($userId)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->paginate(15)
+            ->withQueryString();
+
         return Inertia::render('Welcome', [
-            // Lấy danh sách tweet, bài mới nhất xếp lên đầu
-            'tweets' => Tweet::orderBy('id', 'desc')->get()
+            'tweets' => $tweets,
+            'currentTab' => $tab,
         ]);
     }
 
     /**
-     * 2. Lưu bài viết mới (kèm upload ảnh hoặc video nếu có)
+     * Display a single tweet with its replies thread.
      */
-    public function store(Request $request)
+    public function show(Request $request, $username, $id): Response
     {
-        $file = null;
-        $extension = null;
-        $fileName = null;
-        $path = '';
+        $userId = $request->user()?->id;
 
-        // Kiểm tra nếu người dùng có đính kèm file
-        if ($request->hasFile('file')) {
-            $file = $request->file('file');
-            $request->validate([ 'file' => 'required|mimes:jpg,jpeg,png,mp4' ]);
-            $extension = $file->getClientOriginalExtension();
-            $fileName = time() . '.' . $extension;
+        $tweet = Tweet::where('id', $id)
+            ->withInteractionDetails($userId)
+            ->firstOrFail();
 
-            // Nếu đuôi mp4 thì lưu vào /videos/, còn lại lưu vào /pics/
-            $extension === 'mp4' ? $path = '/videos/' : $path = '/pics/';
+        // Deduplicated view tracking within 2-hour window
+        $ip = $request->ip();
+        $sessionId = $request->session()->getId();
+
+        $recentView = TweetView::where('tweet_id', $tweet->id)
+            ->where(function ($q) use ($userId, $ip, $sessionId) {
+                if ($userId) {
+                    $q->where('user_id', $userId);
+                } else {
+                    $q->where('ip_address', $ip)->orWhere('session_id', $sessionId);
+                }
+            })
+            ->where('created_at', '>=', now()->subHours(2))
+            ->first();
+
+        if (! $recentView) {
+            TweetView::create([
+                'tweet_id' => $tweet->id,
+                'user_id' => $userId,
+                'ip_address' => $ip,
+                'session_id' => $sessionId,
+            ]);
         }
 
-        $tweet = new Tweet;
+        $replies = Tweet::where('parent_id', $tweet->id)
+            ->withInteractionDetails($userId)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->get();
 
-        // Tác giả mặc định
-        $tweet->name = 'John Weeks Dev';
-        $tweet->handle = '@johnweeksdev';
-        $tweet->image = 'https://yt3.ggpht.com/e9o-24_frmNSSVvjS47rT8qCHgsHNiedqgXbzmrmpsj6H1ketcufR1B9vLXTZRa30krRksPj=s88-c-k-c0x00ffffff-no-rj-mo';
-        $tweet->tweet = $request->input('tweet');
-
-        // Nếu có upload file
-        if ($fileName) {
-            $tweet->file = $path . $fileName;
-            $tweet->is_video = ($extension === 'mp4');
-            $file->move(public_path() . $path, $fileName);
-        }
-
-        // Tạo ngẫu nhiên số lượng tương tác
-        $tweet->comments = rand(5, 500);
-        $tweet->retweets = rand(5, 500);
-        $tweet->likes = rand(5, 500);
-        $tweet->analytics = rand(5, 500);
-
-        $tweet->save();
+        return Inertia::render('Tweet/Show', [
+            'tweet' => $tweet,
+            'replies' => $replies,
+        ]);
     }
 
     /**
-     * 3. Xóa Tweet và xóa file media tương ứng
+     * Store a newly created tweet or reply in storage.
      */
-    public function destroy($id)
+    public function store(StoreTweetRequest $request): RedirectResponse
     {
-        $tweet = Tweet::find($id);
+        $filePath = null;
+        $isVideo = false;
 
-        // Nếu bài viết có file và file đó tồn tại trên ổ cứng -> xóa file
-        if (!is_null($tweet->file) && file_exists(public_path() . $tweet->file)) {
-            unlink(public_path() . $tweet->file);
+        if ($request->hasFile('file')) {
+            $file = $request->file('file');
+            $extension = strtolower($file->getClientOriginalExtension());
+            $videoExtensions = ['mp4', 'mov', 'webm'];
+            $isVideo = in_array($extension, $videoExtensions);
+
+            $directory = $isVideo ? 'tweets/videos' : 'tweets/images';
+            $savedPath = $file->store($directory, 'public');
+            $filePath = '/storage/' . $savedPath;
         }
 
-        // Xóa bản ghi trong database
-        $tweet->delete();
+        $parentId = $request->input('parent_id');
+        $quoteOfId = $request->input('quote_of_id');
+
+        $newTweet = $request->user()->tweets()->create([
+            'parent_id' => $parentId,
+            'quote_of_id' => $quoteOfId,
+            'tweet' => $request->input('tweet') ?? '',
+            'file' => $filePath,
+            'is_video' => $isVideo,
+        ]);
+
+        // Sync hashtags
+        $newTweet->syncHashtags();
+
+        // Notify mentions
+        $newTweet->notifyMentions($request->user());
+
+        if ($parentId) {
+            $parent = Tweet::find($parentId);
+            if ($parent && $parent->user_id !== $request->user()->id && $parent->user) {
+                $parent->user->notify(new \App\Notifications\AppActivityNotification($request->user(), 'reply', $newTweet));
+            }
+            return redirect()->back();
+        }
+
+        if ($quoteOfId) {
+            $quoted = Tweet::find($quoteOfId);
+            if ($quoted && $quoted->user_id !== $request->user()->id && $quoted->user) {
+                $quoted->user->notify(new \App\Notifications\AppActivityNotification($request->user(), 'quote', $newTweet));
+            }
+        }
 
         return redirect()->route('tweets.index');
+    }
+
+    /**
+     * Update the specified tweet in storage.
+     */
+    public function update(Request $request, Tweet $tweet): RedirectResponse
+    {
+        $this->authorize('update', $tweet);
+
+        $request->validate([
+            'tweet' => 'required_without:file|nullable|string|max:280',
+            'file' => 'nullable|file|mimes:jpeg,jpg,png,webp,gif|max:5120',
+            'remove_file' => 'nullable|boolean',
+        ]);
+
+        $filePath = $tweet->file;
+        $isVideo = $tweet->is_video;
+
+        if ($request->boolean('remove_file')) {
+            if ($filePath && str_starts_with($filePath, '/storage/')) {
+                Storage::disk('public')->delete(str_replace('/storage/', '', $filePath));
+            }
+            $filePath = null;
+            $isVideo = false;
+        }
+
+        if ($request->hasFile('file')) {
+            // Delete old file if present
+            if ($filePath && str_starts_with($filePath, '/storage/')) {
+                Storage::disk('public')->delete(str_replace('/storage/', '', $filePath));
+            }
+            $uploaded = $request->file('file');
+            $storedPath = $uploaded->store('tweets/images', 'public');
+            $filePath = '/storage/' . $storedPath;
+            $isVideo = false;
+        }
+
+        $tweet->update([
+            'tweet' => $request->input('tweet') ?? '',
+            'file' => $filePath,
+            'is_video' => $isVideo,
+        ]);
+
+        $tweet->syncHashtags();
+        $tweet->notifyMentions($request->user());
+
+        return redirect()->back()->with('success', 'Bài viết đã được cập nhật thành công.');
+    }
+
+    /**
+     * Remove the specified tweet from storage.
+     */
+    public function destroy(Tweet $tweet): RedirectResponse
+    {
+        $this->authorize('delete', $tweet);
+
+        $tweet->delete();
+
+        return redirect()->back();
     }
 }
