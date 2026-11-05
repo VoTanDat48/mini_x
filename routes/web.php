@@ -2,6 +2,10 @@
 
 use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\TweetController;
+use App\Http\Controllers\SearchController;
+use App\Http\Controllers\LikeController;
+use App\Http\Controllers\RetweetController;
+use App\Http\Controllers\BookmarkController;
 use App\Http\Controllers\FollowController;
 use App\Http\Controllers\BlockMuteController;
 use App\Http\Controllers\MessageController;
@@ -23,8 +27,17 @@ Route::post('/tweets', [TweetController::class, 'store'])->name('tweets.store');
 // Xóa bài viết theo ID
 Route::delete('/tweets/{id}', [TweetController::class, 'destroy'])->name('tweets.destroy');
 
+Route::get('/explore', [SearchController::class, 'explore'])->name('explore');
+Route::get('/search', [SearchController::class, 'index'])->name('search');
+Route::get('/{username}/status/{id}', [TweetController::class, 'show'])->name('tweets.show');
+
 // Các route profile và xác thực của Breeze
 Route::middleware('auth')->group(function () {
+    Route::post('/tweets/{tweet}/like', [LikeController::class, 'toggle'])->name('tweets.like');
+    Route::post('/tweets/{tweet}/retweet', [RetweetController::class, 'toggle'])->name('tweets.retweet');
+    Route::post('/tweets/{tweet}/bookmark', [BookmarkController::class, 'toggle'])->name('tweets.bookmark');
+    Route::get('/bookmarks', [BookmarkController::class, 'index'])->name('bookmarks.index');
+
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
     Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
